@@ -1,0 +1,6 @@
+{
+  "name": "Canva to PSD Converter",
+  "description": "Convert Canva design links and templates into fully layered, editable Photoshop PSD files with extracted typography, vector shapes, and graphics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
