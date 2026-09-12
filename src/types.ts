@@ -17,15 +17,22 @@ export interface TextProperties {
   alignment: 'left' | 'center' | 'right';
   lineHeight?: number;
   letterSpacing?: number;
+  textTransform?: 'uppercase' | 'lowercase' | 'capitalize' | 'none';
+  strokeColor?: string;
+  strokeWidth?: number;
+  textShadow?: { color: string; blur: number; offsetX: number; offsetY: number };
 }
 
 export interface ShapeProperties {
   shapeType: 'rectangle' | 'rounded-rectangle' | 'circle' | 'ellipse' | 'badge' | 'line';
   fillColor: string;
+  gradientColors?: string[];
+  gradientAngle?: number;
   strokeColor?: string;
   strokeWidth?: number;
   borderRadius?: number;
   opacity?: number;
+  boxShadow?: { color: string; blur: number; offsetX: number; offsetY: number };
 }
 
 export interface DesignLayer {
@@ -39,6 +46,7 @@ export interface DesignLayer {
   text?: TextProperties;
   shape?: ShapeProperties;
   imageDataUrl?: string; // transparent cutout or slice data URI
+  isOriginalCutout?: boolean;
 }
 
 export interface CanvaDesignAnalysis {
@@ -53,6 +61,13 @@ export interface CanvaDesignAnalysis {
   layers: DesignLayer[];
   previewUrl: string;
   palette: string[];
+  backgroundImageUrl?: string;
+  cleanBackgroundUrl?: string;
+}
+
+export interface CanvaPage {
+  pageNumber: number;
+  url: string;
 }
 
 export interface CanvaFetchResult {
@@ -60,12 +75,16 @@ export interface CanvaFetchResult {
   canvaBlocked?: boolean;
   title: string;
   designId?: string;
+  author?: string;
   previewImageUrl?: string;
   imageBase64?: string;
   width?: number;
   height?: number;
   message?: string;
   url?: string;
+  totalPages?: number;
+  currentPage?: number;
+  pages?: CanvaPage[];
 }
 
 export interface SampleDesign {

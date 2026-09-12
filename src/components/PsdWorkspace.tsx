@@ -30,6 +30,11 @@ interface PsdWorkspaceProps {
   initialAnalysis: CanvaDesignAnalysis;
   originalImageBase64?: string;
   onReset: () => void;
+  docInfo?: {
+    totalPages?: number;
+    currentPage?: number;
+    onSelectPage?: (pageNumber: number) => void;
+  };
 }
 
 const FONT_OPTIONS = [
@@ -49,6 +54,7 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
   initialAnalysis,
   originalImageBase64,
   onReset,
+  docInfo,
 }) => {
   const [analysis, setAnalysis] = useState<CanvaDesignAnalysis>(initialAnalysis);
   const [selectedLayerId, setSelectedLayerId] = useState<string | null>(
@@ -64,6 +70,7 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
   const canvasContainerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const referenceImgRef = useRef<HTMLImageElement | null>(null);
+  const imageCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
 
   // Load original image for reference comparison
   useEffect(() => {
@@ -77,6 +84,25 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
       };
     }
   }, [originalImageBase64]);
+
+  // Image loader helper for cutouts and backgrounds
+  const getLoadedImage = (url?: string): HTMLImageElement | null => {
+    if (!url) return null;
+    const existing = imageCacheRef.current.get(url);
+    if (existing && existing.complete && existing.naturalWidth > 0) {
+      return existing;
+    }
+    if (!existing) {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        drawCanvas();
+      };
+      img.src = url;
+      imageCacheRef.current.set(url, img);
+    }
+    return null;
+  };
 
   // Fit canvas to viewport on mount
   useEffect(() => {
@@ -108,7 +134,10 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
     }
 
     // 1. Draw Background
-    if (analysis.backgroundType === 'gradient' && analysis.gradientColors && analysis.gradientColors.length >= 2) {
+    const cleanBgImg = getLoadedImage(analysis.cleanBackgroundUrl || analysis.backgroundImageUrl);
+    if (cleanBgImg) {
+      ctx.drawImage(cleanBgImg, 0, 0, canvas.width, canvas.height);
+    } else if (analysis.backgroundType === 'gradient' && analysis.gradientColors && analysis.gradientColors.length >= 2) {
       const angleRad = ((analysis.gradientAngle || 135) * Math.PI) / 180;
       const x1 = Math.round(canvas.width / 2 - (Math.cos(angleRad) * canvas.width) / 2);
       const y1 = Math.round(canvas.height / 2 - (Math.sin(angleRad) * canvas.height) / 2);
@@ -121,10 +150,11 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
         grad.addColorStop(i * step, color);
       });
       ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
     } else {
       ctx.fillStyle = analysis.backgroundColor || '#0F172A';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
 
     // 2. Render Layers in z-index order
     for (const layer of analysis.layers) {
@@ -139,11 +169,50 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
       ctx.save();
       ctx.globalAlpha = layer.opacity ?? 1;
 
+      // Draw Raster Image / Visual Cutout
+      if (layer.type === 'image' && layer.imageDataUrl) {
+        const cutoutImg = getLoadedImage(layer.imageDataUrl);
+        if (cutoutImg) {
+          ctx.drawImage(cutoutImg, x, y, w, h);
+        }
+      }
+
       // Draw Shapes
       if (layer.shape) {
-        const { shapeType, fillColor, strokeColor, strokeWidth = 0, borderRadius = 0, opacity = 1 } = layer.shape;
+        const {
+          shapeType,
+          fillColor,
+          gradientColors,
+          gradientAngle,
+          strokeColor,
+          strokeWidth = 0,
+          borderRadius = 0,
+          opacity = 1,
+          boxShadow,
+        } = layer.shape;
+
         ctx.globalAlpha = (layer.opacity ?? 1) * opacity;
-        ctx.fillStyle = fillColor;
+
+        if (boxShadow) {
+          ctx.shadowColor = boxShadow.color;
+          ctx.shadowBlur = boxShadow.blur;
+          ctx.shadowOffsetX = boxShadow.offsetX;
+          ctx.shadowOffsetY = boxShadow.offsetY;
+        }
+
+        if (gradientColors && gradientColors.length >= 2) {
+          const angleRad = ((gradientAngle ?? 135) * Math.PI) / 180;
+          const x1 = Math.round(x + w / 2 - (Math.cos(angleRad) * w) / 2);
+          const y1 = Math.round(y + h / 2 - (Math.sin(angleRad) * h) / 2);
+          const x2 = Math.round(x + w / 2 + (Math.cos(angleRad) * w) / 2);
+          const y2 = Math.round(y + h / 2 + (Math.sin(angleRad) * h) / 2);
+          const grad = ctx.createLinearGradient(x1, y1, x2, y2);
+          const step = 1 / (gradientColors.length - 1);
+          gradientColors.forEach((col, idx) => grad.addColorStop(idx * step, col));
+          ctx.fillStyle = grad;
+        } else {
+          ctx.fillStyle = fillColor || '#3B82F6';
+        }
 
         const halfStroke = strokeWidth / 2;
         const drawW = Math.max(1, w - strokeWidth);
@@ -187,7 +256,21 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
 
       // Draw Text
       if (layer.text) {
-        const { content, fontFamily, fontSize, fontWeight, color, alignment, lineHeight } = layer.text;
+        const {
+          content,
+          fontFamily,
+          fontSize,
+          fontWeight,
+          color,
+          alignment,
+          lineHeight,
+          textTransform,
+          textShadow,
+          strokeColor,
+          strokeWidth = 0,
+          letterSpacing,
+        } = layer.text;
+
         ctx.fillStyle = color;
         ctx.textBaseline = 'top';
 
@@ -195,7 +278,25 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
         const family = fontFamily ? `"${fontFamily}", sans-serif` : 'Montserrat, sans-serif';
         ctx.font = `${weight} ${fontSize}px ${family}`;
 
-        const lines = content.split('\n');
+        if (letterSpacing && (ctx as any).letterSpacing !== undefined) {
+          (ctx as any).letterSpacing = `${letterSpacing}px`;
+        }
+
+        if (textShadow) {
+          ctx.shadowColor = textShadow.color;
+          ctx.shadowBlur = textShadow.blur;
+          ctx.shadowOffsetX = textShadow.offsetX;
+          ctx.shadowOffsetY = textShadow.offsetY;
+        }
+
+        let finalContent = content;
+        if (textTransform === 'uppercase') {
+          finalContent = content.toUpperCase();
+        } else if (textTransform === 'lowercase') {
+          finalContent = content.toLowerCase();
+        }
+
+        const lines = finalContent.split('\n');
         const lineH = lineHeight ? fontSize * lineHeight : fontSize * 1.25;
 
         lines.forEach((line, index) => {
@@ -210,7 +311,16 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
             ctx.textAlign = 'left';
             xPos = x;
           }
-          ctx.fillText(line, xPos, y + index * lineH);
+
+          const yPos = y + index * lineH;
+
+          if (strokeColor && strokeWidth > 0) {
+            ctx.strokeStyle = strokeColor;
+            ctx.lineWidth = strokeWidth;
+            ctx.strokeText(line, xPos, yPos);
+          }
+
+          ctx.fillText(line, xPos, yPos);
         });
       }
 
@@ -306,7 +416,7 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
   const handleDownloadPsd = async () => {
     setIsExporting(true);
     try {
-      const psdUint8 = await generatePsdUint8Array(analysis, referenceImgRef.current);
+      const psdUint8 = await generatePsdUint8Array(analysis, referenceImgRef.current, canvasRef.current);
       downloadPsdFile(psdUint8, analysis.title);
     } catch (err: any) {
       console.error('Error generating PSD:', err);
@@ -320,7 +430,7 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
   const handleOpenPhotopea = async () => {
     setIsExporting(true);
     try {
-      const psdUint8 = await generatePsdUint8Array(analysis, referenceImgRef.current);
+      const psdUint8 = await generatePsdUint8Array(analysis, referenceImgRef.current, canvasRef.current);
       openInPhotopea(psdUint8);
     } catch (err: any) {
       console.error('Error opening in Photopea:', err);
@@ -388,6 +498,37 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
               <span className="text-emerald-400 font-medium">RGB 8-bit PSD</span>
             </div>
           </div>
+
+          {/* Multi-page / multi-slide indicator if Canva document has multiple pages */}
+          {docInfo && docInfo.totalPages && docInfo.totalPages > 1 && (
+            <div className="hidden md:flex items-center gap-1.5 ml-2 px-2.5 py-1 rounded-lg bg-indigo-950/60 border border-indigo-800/50 text-xs">
+              <span className="text-indigo-300 font-medium text-[11px]">
+                Page {docInfo.currentPage || 1} of {docInfo.totalPages}
+              </span>
+              {docInfo.onSelectPage && (
+                <div className="flex items-center gap-1 ml-1">
+                  <button
+                    type="button"
+                    disabled={(docInfo.currentPage || 1) <= 1}
+                    onClick={() => docInfo.onSelectPage?.((docInfo.currentPage || 1) - 1)}
+                    className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 text-[10px] cursor-pointer"
+                    title="Previous page"
+                  >
+                    ◀
+                  </button>
+                  <button
+                    type="button"
+                    disabled={(docInfo.currentPage || 1) >= docInfo.totalPages}
+                    onClick={() => docInfo.onSelectPage?.((docInfo.currentPage || 1) + 1)}
+                    className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 disabled:opacity-40 text-[10px] cursor-pointer"
+                    title="Next page"
+                  >
+                    ▶
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* View Mode Switcher */}
@@ -607,10 +748,10 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
                     <span className="text-[10px] text-slate-500">{groupLayers.length}</span>
                   </button>
 
-                  {/* Layers within folder */}
+                  {/* Layers within folder (displayed in top-down Photoshop stack order) */}
                   {!isCollapsed && (
                     <div className="pl-2 space-y-0.5 border-l border-slate-800 ml-2">
-                      {groupLayers.map((layer) => {
+                      {[...groupLayers].reverse().map((layer) => {
                         const isSelected = layer.id === selectedLayerId;
 
                         return (
@@ -758,29 +899,85 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
                       </span>
                     </div>
 
-                    {/* Alignment buttons */}
-                    <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg p-0.5">
-                      {(['left', 'center', 'right'] as const).map((align) => (
-                        <button
-                          key={align}
-                          type="button"
-                          onClick={() =>
-                            updateSelectedLayer((l) => ({
-                              ...l,
-                              text: { ...l.text!, alignment: align },
-                            }))
-                          }
-                          className={`px-2 py-0.5 rounded capitalize text-[10px] font-medium transition-colors cursor-pointer ${
-                            selectedLayer.text?.alignment === align
-                              ? 'bg-indigo-600 text-white'
-                              : 'text-slate-400 hover:text-white'
-                          }`}
-                        >
-                          {align}
-                        </button>
-                      ))}
+                    {/* Alignment & Transform */}
+                    <div className="flex items-center justify-between gap-2 pt-1">
+                      {/* Alignment buttons */}
+                      <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg p-0.5">
+                        {(['left', 'center', 'right'] as const).map((align) => (
+                          <button
+                            key={align}
+                            type="button"
+                            onClick={() =>
+                              updateSelectedLayer((l) => ({
+                                ...l,
+                                text: { ...l.text!, alignment: align },
+                              }))
+                            }
+                            className={`px-2 py-0.5 rounded capitalize text-[10px] font-medium transition-colors cursor-pointer ${
+                              selectedLayer.text?.alignment === align
+                                ? 'bg-indigo-600 text-white'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                          >
+                            {align}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Text Transform */}
+                      <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg p-0.5">
+                        {(['none', 'uppercase', 'lowercase'] as const).map((trans) => (
+                          <button
+                            key={trans}
+                            type="button"
+                            onClick={() =>
+                              updateSelectedLayer((l) => ({
+                                ...l,
+                                text: { ...l.text!, textTransform: trans },
+                              }))
+                            }
+                            className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                              (selectedLayer.text?.textTransform || 'none') === trans
+                                ? 'bg-cyan-600 text-white font-bold'
+                                : 'text-slate-400 hover:text-white'
+                            }`}
+                            title={`Text transform: ${trans}`}
+                          >
+                            {trans === 'none' ? 'Aa' : trans === 'uppercase' ? 'AA' : 'aa'}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
+                </div>
+              )}
+
+              {/* Image / Cutout Layer Controls */}
+              {selectedLayer.type === 'image' && (
+                <div className="space-y-2">
+                  <span className="text-[11px] text-slate-400 block">High-Resolution Visual Asset</span>
+                  {selectedLayer.imageDataUrl ? (
+                    <div className="p-2 bg-slate-900 rounded-lg border border-slate-800 flex items-center gap-3">
+                      <div className="w-16 h-16 rounded border border-slate-700 bg-slate-950 flex items-center justify-center overflow-hidden shrink-0">
+                        <img
+                          src={selectedLayer.imageDataUrl}
+                          alt="Cutout thumbnail"
+                          className="max-w-full max-h-full object-contain"
+                        />
+                      </div>
+                      <div className="min-w-0 flex-1 text-[11px] text-slate-300">
+                        <p className="font-semibold text-white truncate">{selectedLayer.name}</p>
+                        <p className="text-slate-500 font-mono text-[10px] mt-0.5">
+                          {selectedLayer.bounds.width} × {selectedLayer.bounds.height} px
+                        </p>
+                        <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 font-mono text-[9px]">
+                          Smart Raster Cutout
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-500 italic">No direct raster cutout data.</p>
+                  )}
                 </div>
               )}
 
@@ -806,6 +1003,22 @@ export const PsdWorkspace: React.FC<PsdWorkspaceProps> = ({
                       </span>
                     </div>
                   </div>
+
+                  {selectedLayer.shape.gradientColors && selectedLayer.shape.gradientColors.length > 0 && (
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-[11px] text-slate-400">Gradient Stops</span>
+                      <div className="flex items-center gap-1">
+                        {selectedLayer.shape.gradientColors.map((col, idx) => (
+                          <div
+                            key={idx}
+                            style={{ backgroundColor: col }}
+                            className="w-4 h-4 rounded-full border border-white/20"
+                            title={col}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div>
                     <label className="text-[11px] text-slate-400 flex justify-between mb-1">

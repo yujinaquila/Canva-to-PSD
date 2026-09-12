@@ -34,141 +34,263 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Helper: Clean and extract Canva URL / design ID
-function extractCanvaInfo(rawInput: string): { normalizedUrl: string; designId: string | null } {
+// Helper: Clean, resolve redirects, and extract Canva canonical URL / design ID
+async function resolveCanvaTarget(rawInput: string): Promise<{
+  originalInput: string;
+  canonicalUrl: string;
+  viewUrl: string;
+  embedUrl: string;
+  designId: string | null;
+}> {
   let input = rawInput.trim();
 
   // If user pasted an embed code snippet e.g. <iframe ... src="..." ...>
-  const iframeSrcMatch = input.match(/src=["'](https:\/\/[^"']*canva\.com[^"']*)["']/i);
+  const iframeSrcMatch = input.match(/src=["'](https:\/\/[^"']*canva\.(?:com|link)[^"']*)["']/i);
   if (iframeSrcMatch) {
     input = iframeSrcMatch[1];
   }
 
-  // Extract design ID from standard Canva URL structures
-  // e.g. canva.com/design/DAG.../view or canva.com/templates/EAF...
-  const designIdMatch = input.match(/canva\.com\/(?:design|templates)\/([A-Za-z0-9_-]+)/i);
-  const designId = designIdMatch ? designIdMatch[1] : null;
-
-  // Clean URL: ensure https
-  let normalizedUrl = input;
-  if (!normalizedUrl.startsWith("http://") && !normalizedUrl.startsWith("https://")) {
-    normalizedUrl = "https://" + normalizedUrl;
+  // Ensure scheme
+  let currentUrl = input;
+  if (!currentUrl.startsWith("http://") && !currentUrl.startsWith("https://")) {
+    currentUrl = "https://" + currentUrl;
   }
 
-  return { normalizedUrl, designId };
+  // Follow redirects (e.g. canva.link shortlinks or 301/302 redirects)
+  let hops = 0;
+  while (hops < 6) {
+    hops++;
+    try {
+      const redirectRes = await fetch(currentUrl, {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+      });
+
+      const locationHeader = redirectRes.headers.get("location");
+      if (locationHeader && (redirectRes.status === 301 || redirectRes.status === 302 || redirectRes.status === 307 || redirectRes.status === 308)) {
+        currentUrl = locationHeader.startsWith("http")
+          ? locationHeader
+          : new URL(locationHeader, currentUrl).toString();
+      } else {
+        break;
+      }
+    } catch (err) {
+      console.warn(`Redirect hop ${hops} warning:`, err);
+      break;
+    }
+  }
+
+  // Extract design ID
+  const designIdMatch = currentUrl.match(/canva\.com\/(?:design|templates)\/([A-Za-z0-9_-]+)/i);
+  const designId = designIdMatch ? designIdMatch[1] : null;
+
+  // Normalize /edit -> /view and /view?embed
+  let viewUrl = currentUrl;
+  if (/\/edit(\?.*)?$/i.test(currentUrl)) {
+    viewUrl = currentUrl.replace(/\/edit(\?.*)?$/i, "/view");
+  } else if (!/\/view(\?.*)?$/i.test(currentUrl) && designId) {
+    // If it's a bare design link or template link
+    viewUrl = currentUrl.replace(/(\?.*)?$/, "/view");
+  }
+
+  let embedUrl = viewUrl;
+  if (embedUrl.includes("/view")) {
+    embedUrl = embedUrl.replace(/\/view(\?.*)?$/i, "/view?embed");
+  } else {
+    embedUrl = embedUrl + (embedUrl.includes("?") ? "&embed" : "?embed");
+  }
+
+  return {
+    originalInput: input,
+    canonicalUrl: currentUrl,
+    viewUrl,
+    embedUrl,
+    designId,
+  };
 }
 
-// Route 1: Fetch and parse Canva link
+// Route 1: Fetch and parse Canva link (handles shortlinks, view links, embed codes, and multi-page designs)
 app.post("/api/canva/fetch-link", async (req, res) => {
   try {
-    const { url } = req.body;
+    const { url, pageIndex = 0 } = req.body;
     if (!url || typeof url !== "string") {
       res.status(400).json({ success: false, message: "URL is required" });
       return;
     }
 
-    const { normalizedUrl, designId } = extractCanvaInfo(url);
-
-    // Fetch the Canva link with browser-grade headers
-    let html = "";
-    let status = 0;
-    try {
-      const response = await fetch(normalizedUrl, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Sec-Fetch-Dest": "document",
-          "Sec-Fetch-Mode": "navigate",
-          "Sec-Fetch-Site": "none",
-        },
-      });
-      status = response.status;
-      if (response.ok) {
-        html = await response.text();
-      }
-    } catch (fetchErr: any) {
-      console.warn("Direct fetch error:", fetchErr.message);
-    }
+    const { canonicalUrl, viewUrl, embedUrl, designId } = await resolveCanvaTarget(url);
 
     let title = "Canva Design";
+    let author: string | undefined;
     let previewImageUrl: string | null = null;
     let width = 1080;
     let height = 1080;
+    let imageBase64: string | null = null;
+    let pages: Array<{ pageNumber: number; url: string }> = [];
 
-    if (html) {
-      // Extract title
-      const ogTitleMatch =
-        html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
-        html.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:title["']/i) ||
-        html.match(/<title>([^<]+)<\/title>/i);
-      if (ogTitleMatch) {
-        title = ogTitleMatch[1].replace(/\s*-\s*Canva$/i, "").trim();
+    // Step 1: Query Canva official oEmbed endpoint for exact title, author, and dimensions
+    try {
+      const oembedUrl = `https://www.canva.com/_oembed?url=${encodeURIComponent(viewUrl)}`;
+      const oembedRes = await fetch(oembedUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          Accept: "application/json",
+        },
+      });
+      if (oembedRes.ok) {
+        const oembedData = await oembedRes.json();
+        if (oembedData.title) {
+          title = oembedData.title.replace(/\s*-\s*Canva$/i, "").trim();
+        }
+        if (oembedData.author_name) {
+          author = oembedData.author_name;
+        }
+        if (oembedData.width && typeof oembedData.width === "number") {
+          width = oembedData.width;
+        }
+        if (oembedData.height && typeof oembedData.height === "number") {
+          height = oembedData.height;
+        }
       }
-
-      // Extract preview image (OpenGraph / Twitter / thumbnail)
-      const ogImageMatch =
-        html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i) ||
-        html.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:image["']/i) ||
-        html.match(/<meta\s+name=["']twitter:image["']\s+content=["']([^"']+)["']/i) ||
-        html.match(/<meta\s+content=["']([^"']+)["']\s+name=["']twitter:image["']/i);
-      if (ogImageMatch) {
-        previewImageUrl = ogImageMatch[1];
-      }
-
-      // Dimensions
-      const widthMatch = html.match(/property=["']og:image:width["']\s+content=["'](\d+)["']/i);
-      const heightMatch = html.match(/property=["']og:image:height["']\s+content=["'](\d+)["']/i);
-      if (widthMatch) width = parseInt(widthMatch[1], 10);
-      if (heightMatch) height = parseInt(heightMatch[1], 10);
+    } catch (oembedErr: any) {
+      console.warn("Canva oEmbed query notice:", oembedErr.message);
     }
 
-    // If an image URL was extracted, download and convert to base64
-    let imageBase64: string | null = null;
-    if (previewImageUrl) {
+    // Step 2: Fetch embed viewer page to extract direct AWS pre-signed S3 page exports
+    try {
+      const embedRes = await fetch(embedUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+
+      if (embedRes.ok) {
+        const embedHtml = await embedRes.text();
+
+        // Extract fallback URLs which contain pre-signed S3 download links for rendered canvas slides
+        const fallbackMatches = [...embedHtml.matchAll(/fallback=([^\s\"'&]+)/gi)].map((m) =>
+          decodeURIComponent(m[1])
+        );
+
+        if (fallbackMatches.length > 0) {
+          // De-duplicate URLs
+          const uniqueUrls = [...new Set(fallbackMatches)];
+          pages = uniqueUrls.map((imgUrl, idx) => ({
+            pageNumber: idx + 1,
+            url: imgUrl,
+          }));
+
+          // Select requested page or default to page 1
+          const selectedIndex = Math.min(Math.max(0, pageIndex), pages.length - 1);
+          const targetImageUrl = pages[selectedIndex].url;
+          previewImageUrl = targetImageUrl;
+
+          // Download image directly from S3
+          const imgRes = await fetch(targetImageUrl, {
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
+          });
+
+          if (imgRes.ok) {
+            const buffer = Buffer.from(await imgRes.arrayBuffer());
+            const contentType = imgRes.headers.get("content-type") || "image/png";
+            imageBase64 = `data:${contentType};base64,${buffer.toString("base64")}`;
+          }
+        }
+      }
+    } catch (embedErr: any) {
+      console.warn("Canva embed scraper notice:", embedErr.message);
+    }
+
+    // Step 3: Fallback - try direct fetch of viewUrl if embed didn't provide imageBase64
+    if (!imageBase64) {
       try {
-        const imgRes = await fetch(previewImageUrl, {
+        const response = await fetch(viewUrl, {
           headers: {
             "User-Agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            Referer: "https://www.canva.com/",
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
           },
         });
-        if (imgRes.ok) {
-          const buffer = Buffer.from(await imgRes.arrayBuffer());
-          const contentType = imgRes.headers.get("content-type") || "image/jpeg";
-          imageBase64 = `data:${contentType};base64,${buffer.toString("base64")}`;
+
+        if (response.ok) {
+          const html = await response.text();
+
+          if (title === "Canva Design") {
+            const ogTitleMatch =
+              html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i) ||
+              html.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:title["']/i) ||
+              html.match(/<title>([^<]+)<\/title>/i);
+            if (ogTitleMatch) {
+              title = ogTitleMatch[1].replace(/\s*-\s*Canva$/i, "").trim();
+            }
+          }
+
+          const ogImageMatch =
+            html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i) ||
+            html.match(/<meta\s+content=["']([^"']+)["']\s+property=["']og:image["']/i) ||
+            html.match(/<meta\s+name=["']twitter:image["']\s+content=["']([^"']+)["']/i);
+          if (ogImageMatch) {
+            previewImageUrl = ogImageMatch[1];
+            const imgRes = await fetch(previewImageUrl, {
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                Referer: "https://www.canva.com/",
+              },
+            });
+            if (imgRes.ok) {
+              const buffer = Buffer.from(await imgRes.arrayBuffer());
+              const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+              imageBase64 = `data:${contentType};base64,${buffer.toString("base64")}`;
+            }
+          }
         }
-      } catch (imgErr) {
-        console.warn("Could not download extracted preview image:", imgErr);
+      } catch (directErr: any) {
+        console.warn("Direct viewUrl fetch notice:", directErr.message);
       }
     }
 
-    // Return result
+    // Return successfully decompiled design metadata and image
     if (imageBase64) {
       res.json({
         success: true,
-        title,
+        title: title || (designId ? `Canva Design (${designId})` : "Canva Design"),
+        author,
         designId,
         previewImageUrl,
         imageBase64,
         width,
         height,
-        url: normalizedUrl,
+        url: canonicalUrl,
+        totalPages: pages.length,
+        currentPage: pageIndex + 1,
+        pages,
       });
       return;
     }
 
-    // If Canva returned bot challenge or status 403 / redirect
+    // If Canva was blocked or image couldn't be fetched
     res.json({
       success: false,
       canvaBlocked: true,
       designId,
-      title: designId ? `Canva Design (${designId})` : "Canva Design",
+      title: title !== "Canva Design" ? title : (designId ? `Canva Design (${designId})` : "Canva Design"),
       message:
-        "Canva enforces Cloudflare bot protection on automated cloud server requests for this URL. You can paste the Canva embed HTML code, load via direct preview image, or upload/drop your exported Canva image/PDF below for instant editable PSD conversion.",
-      url: normalizedUrl,
+        "Canva protected this design behind an authentication or Cloudflare bot check. You can paste the Canva embed HTML code, or upload/drop your exported Canva image (PNG/JPG) or PDF below for instant editable PSD decomposition.",
+      url: canonicalUrl,
     });
   } catch (error: any) {
     console.error("Error in /api/canva/fetch-link:", error);
@@ -185,9 +307,12 @@ app.post("/api/canva/analyze-design", async (req, res) => {
       return;
     }
 
-    // Extract raw base64 string and mimeType
-    const mimeMatch = imageBase64.match(/^data:(image\/[a-zA-Z+]+);base64,(.+)$/);
-    const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
+    // Extract raw base64 string and mimeType (supports image/png, image/jpeg, image/webp, application/pdf, etc.)
+    const mimeMatch = imageBase64.match(/^data:([a-zA-Z0-9/+-]+);base64,(.+)$/);
+    let mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
+    if (mimeType.includes("pdf")) {
+      mimeType = "application/pdf";
+    }
     const rawBase64 = mimeMatch ? mimeMatch[2] : imageBase64;
 
     const ai = getGenAI();
@@ -198,46 +323,68 @@ app.post("/api/canva/analyze-design", async (req, res) => {
       return;
     }
 
-    const systemInstruction = `You are a world-class Adobe Photoshop Document (.psd) graphic design engineer.
-Your task is to visually analyze this Canva design graphic and reverse-engineer it into a clean, professional, fully editable multi-layered Photoshop document structure.
+    const targetW = dimensions?.width || 1080;
+    const targetH = dimensions?.height || 1080;
 
-Carefully deconstruct every visual element into discrete layers:
-1. Canvas dimensions: calculate exact resolution in pixels (e.g. 1080x1080, 1080x1350, 1920x1080, 1200x630, etc.).
-2. Color Palette: extract 4-6 dominant colors as HEX codes.
-3. Background: dominant background color, gradient colors (if gradient), and backgroundType ("solid", "gradient", or "photo").
-4. Layers in bottom-to-top z-index order:
-   - "Typography": EVERY single text line/block MUST be extracted as an individual text layer. Identify:
-     - exact text content (maintain multiline text, uppercase/lowercase)
-     - fontFamily: match the visual style to standard Google/Photoshop fonts (e.g. "Montserrat", "Poppins", "Playfair Display", "Roboto", "Oswald", "Bebas Neue", "Inter", "Lato")
-     - fontSize: accurate estimated font size in pixels relative to the canvas dimensions
-     - fontWeight: "normal", "medium", "bold", "800", or "900"
-     - color: hex color code (e.g. #FFFFFF, #1E293B)
-     - alignment: "left", "center", or "right"
-     - bounding box: { x, y, width, height } in exact canvas pixels
-   - "Graphics & Accents": Badges (e.g. "50% OFF", "NEW"), buttons, CTA tags, ribbons, banners, stars, dividers, framing cards.
-     - shapeType: "rectangle" | "rounded-rectangle" | "circle" | "badge" | "line"
-     - fillColor: hex color
-     - strokeColor: hex color (if bordered)
-     - strokeWidth: number
-     - borderRadius: number
-     - opacity: number (0 to 1)
-     - bounds: { x, y, width, height } in pixels
-   - "Visuals": photos, illustrations, icons, product graphics.
-     - name: descriptive name (e.g. "Product Cutout Photo", "Geometric Graphic Accent")
-     - bounds: { x, y, width, height } in pixels
-   - "Background": Base canvas background layer
+    const systemInstruction = `You are an elite Adobe Photoshop Document (.psd) master graphic engineer and reverse-engineering specialist.
+Your mission is to visually dissect this Canva/graphic design into a comprehensive, high-fidelity, fully editable multi-layered Photoshop document structure with extraordinary attention to detail.
+
+CRITICAL CANVAS DIMENSION RULE:
+The source canvas resolution is EXACTLY ${targetW} x ${targetH} px (aspect ratio ${targetW}:${targetH}).
+All bounding boxes { "x", "y", "width", "height" } and font sizes MUST be mapped strictly to this [0, ${targetW}] × [0, ${targetH}] pixel coordinate space.
+
+DECONSTRUCTION REQUIREMENTS (LEAVE NOTHING OUT):
+1. CANVAS & BACKGROUND:
+   - "backgroundType": "photo" (if backdrop has photographs, scenery, complex artwork, wallpapers, or textured imagery), "gradient" (if smooth 2+ color transition), or "solid" (if single solid color).
+   - "backgroundColor": dominant hex color (e.g. #0F172A).
+   - "gradientColors": 2-4 hex color stops if gradient.
+   - "gradientAngle": angle in degrees (e.g. 0, 45, 90, 135, 180).
+   - "palette": 5-7 dominant branding colors extracted across the design.
+
+2. TYPOGRAPHY (EXTRACT EVERY SINGLE TEXT ITEM):
+   - You MUST extract EVERY piece of text without omission: large headlines, subheadlines, kicker categories, promotional tags, discount badges ("50% OFF", "SALE"), button text ("GET STARTED", "SHOP NOW"), dates, prices ("$99", "FREE"), addresses, website URLs, social handles, disclaimers, bullet lists.
+   - "content": exact literal wording, preserving uppercase/lowercase and line breaks ('\\n').
+   - "fontFamily": accurately match the typographic style to standard Google Fonts:
+     * Modern Sans: "Montserrat", "Poppins", "Inter", "Plus Jakarta Sans", "Lato", "Roboto", "Open Sans"
+     * Bold Condensed/Display: "Oswald", "Bebas Neue", "Anton", "Barlow Condensed"
+     * Elegant Serif: "Playfair Display", "Merriweather", "Cinzel", "Lora", "Bodoni Moda"
+     * Script/Accent: "Pacifico", "Dancing Script", "Caveat"
+   - "fontSize": accurate font size in px relative to the ${targetH}px canvas height.
+   - "fontWeight": "normal" (400), "medium" (500), "bold" (700), "800", or "900".
+   - "color": exact hex color code (e.g. #FFFFFF, #E2E8F0, #FF5500).
+   - "alignment": "left", "center", or "right".
+   - "textTransform": "uppercase" | "lowercase" | "capitalize" | "none".
+   - "bounds": exact pixel bounding box { x, y, width, height } that tightly frames this text block.
+
+3. SHAPES, BADGES & BUTTONS:
+   - Identify all vector/UI shape containers: CTA button pills, framing background cards, discount badge circles/stars, price tags, decorative ribbon banners, accent separator lines, icon container boxes.
+   - "shapeType": "rounded-rectangle" | "circle" | "rectangle" | "badge" | "line".
+   - "fillColor": hex color.
+   - "gradientColors": array of hex colors if shape has a gradient fill.
+   - "strokeColor": hex color if shape has an outline/border.
+   - "strokeWidth": border thickness in px (0 if no border).
+   - "borderRadius": corner radius in px (e.g. 24-50 for pill buttons, 12-24 for cards, or half-width for circles).
+   - "opacity": 0.0 to 1.0.
+   - "bounds": exact pixel bounding box { x, y, width, height }.
+
+4. VISUALS, PHOTOS, ILLUSTRATIONS & LOGOS:
+   - CRITICAL: Identify EVERY photograph, product shot, model/person cutout, graphic illustration, brand logo, decorative vector asset, or icon in the design!
+   - "type": "image".
+   - "group": "Visuals".
+   - "name": descriptive name (e.g. "Product Hero Cutout", "Portrait Model Photo", "Brand Logo Emblem", "Shopping Cart Icon", "Geometric Graphic Accent").
+   - "bounds": exact bounding box { x, y, width, height } framing this visual asset so our automated rasterizer can extract the crisp high-definition cutout directly from the source image.
 
 Output strict JSON only adhering to this structure:
 {
-  "title": "string",
-  "width": 1080,
-  "height": 1080,
-  "aspectRatio": "1:1",
+  "title": "${title}",
+  "width": ${targetW},
+  "height": ${targetH},
+  "aspectRatio": "${targetW}:${targetH}",
   "backgroundColor": "#HEX",
   "backgroundType": "solid" | "gradient" | "photo",
   "gradientColors": ["#HEX1", "#HEX2"],
-  "gradientAngle": 45,
-  "palette": ["#HEX1", "#HEX2", "#HEX3", "#HEX4"],
+  "gradientAngle": 135,
+  "palette": ["#HEX1", "#HEX2", "#HEX3", "#HEX4", "#HEX5"],
   "layers": [
     {
       "id": "layer_1",
@@ -253,11 +400,13 @@ Output strict JSON only adhering to this structure:
         "fontSize": 48,
         "fontWeight": "bold",
         "color": "#FFFFFF",
-        "alignment": "center"
+        "alignment": "center",
+        "textTransform": "uppercase"
       },
       "shape": {
         "shapeType": "rounded-rectangle",
         "fillColor": "#FF5500",
+        "gradientColors": ["#FF5500", "#FF2200"],
         "strokeColor": "#FFFFFF",
         "strokeWidth": 2,
         "borderRadius": 12,
@@ -267,34 +416,53 @@ Output strict JSON only adhering to this structure:
   ]
 }`;
 
-    const promptText = `Analyze this Canva graphic and deconstruct it into an editable multi-layer Photoshop PSD structure. Extract all text content, typography styles, button/badge shapes, and bounding boxes.`;
+    const promptText = `Analyze this Canva design (${targetW}x${targetH}px) and reverse-engineer it into a complete, professional multi-layer Photoshop PSD structure. Extract EVERY text element with exact wording and font attributes, all buttons and shapes, and pinpoint bounding boxes for all photos, illustrations, and logos.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.8-flash",
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType,
-              data: rawBase64,
-            },
+    let responseText = "";
+    const modelsToTry = ["gemini-3.8-flash", "gemini-3.6-flash"];
+    let lastError: any = null;
+
+    for (const modelName of modelsToTry) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType,
+                  data: rawBase64,
+                },
+              },
+              { text: promptText },
+            ],
           },
-          { text: promptText },
-        ],
-      },
-      config: {
-        systemInstruction,
-        responseMimeType: "application/json",
-        temperature: 0.2,
-      },
-    });
+          config: {
+            systemInstruction,
+            responseMimeType: "application/json",
+            temperature: 0.15,
+          },
+        });
+        if (response.text) {
+          responseText = response.text;
+          break;
+        }
+      } catch (genErr: any) {
+        lastError = genErr;
+        console.warn(`Model ${modelName} analysis attempt notice:`, genErr.message);
+      }
+    }
 
-    const responseText = response.text || "";
     let parsedData: any;
-    try {
-      parsedData = JSON.parse(responseText.trim());
-    } catch (jsonErr) {
-      console.error("Failed to parse Gemini JSON output:", responseText.slice(0, 500));
+    if (responseText) {
+      try {
+        parsedData = JSON.parse(responseText.trim());
+      } catch (jsonErr) {
+        console.error("Failed to parse Gemini JSON output:", responseText.slice(0, 500));
+        parsedData = generateHeuristicLayers(title, dimensions);
+      }
+    } else {
+      console.warn("AI models unavailable, using heuristic layer extractor:", lastError?.message);
       parsedData = generateHeuristicLayers(title, dimensions);
     }
 
@@ -302,6 +470,26 @@ Output strict JSON only adhering to this structure:
     if (!parsedData.layers || !Array.isArray(parsedData.layers) || parsedData.layers.length === 0) {
       parsedData = generateHeuristicLayers(title, dimensions);
     }
+
+    // Sanitize and clamp all layer bounds to ensure coordinates never overflow
+    parsedData.width = targetW;
+    parsedData.height = targetH;
+    parsedData.aspectRatio = `${targetW}:${targetH}`;
+
+    parsedData.layers = parsedData.layers.map((layer: any, idx: number) => {
+      const bx = Math.max(0, Math.min(layer.bounds?.x ?? 0, targetW - 10));
+      const by = Math.max(0, Math.min(layer.bounds?.y ?? 0, targetH - 10));
+      const bw = Math.max(10, Math.min(layer.bounds?.width ?? 100, targetW - bx));
+      const bh = Math.max(10, Math.min(layer.bounds?.height ?? 40, targetH - by));
+
+      return {
+        ...layer,
+        id: layer.id || `layer_${idx + 1}`,
+        bounds: { x: Math.round(bx), y: Math.round(by), width: Math.round(bw), height: Math.round(bh) },
+        visible: layer.visible !== false,
+        opacity: typeof layer.opacity === "number" ? Math.max(0, Math.min(1, layer.opacity)) : 1,
+      };
+    });
 
     // Ensure title and preview
     parsedData.title = parsedData.title || title;

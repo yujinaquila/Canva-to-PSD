@@ -57,7 +57,12 @@ export const CanvaInputSection: React.FC<CanvaInputSectionProps> = ({
     setIsDragOver(false);
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
-      if (file.type.startsWith('image/') || file.type === 'application/pdf') {
+      if (
+        file.type.startsWith('image/') ||
+        file.type === 'application/pdf' ||
+        file.type.includes('pdf') ||
+        file.name.toLowerCase().endsWith('.pdf')
+      ) {
         onConvertFile(file);
       }
     }
@@ -84,7 +89,7 @@ export const CanvaInputSection: React.FC<CanvaInputSectionProps> = ({
 
       // If user pasted text into window when input is not focused
       const text = e.clipboardData?.getData('text/plain');
-      if (text && (text.includes('canva.com') || text.includes('<iframe')) && document.activeElement !== document.querySelector('input')) {
+      if (text && (text.includes('canva.com') || text.includes('canva.link') || text.includes('<iframe')) && document.activeElement !== document.querySelector('input')) {
         setInputValue(text.trim());
       }
     };
@@ -99,13 +104,13 @@ export const CanvaInputSection: React.FC<CanvaInputSectionProps> = ({
       <div className="text-center mb-8">
         <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 text-xs font-semibold mb-3">
           <Sparkles className="w-3.5 h-3.5" />
-          <span>Canva Design Reverse-Engineering Engine</span>
+          <span>Canva Link & Shortlink Reverse-Engineering Engine</span>
         </div>
         <h2 className="text-3xl sm:text-4xl font-extrabold text-white tracking-tight">
           Convert Canva Links into Editable PSD
         </h2>
         <p className="mt-2.5 text-sm sm:text-base text-slate-400 max-w-2xl mx-auto">
-          Paste any public Canva share link, template, or embed code. Our AI deconstructs the canvas into native Photoshop text layers, vector shapes, and discrete assets.
+          Paste any Canva share link (including <span className="text-indigo-300 font-mono text-xs bg-indigo-950/60 px-1.5 py-0.5 rounded border border-indigo-800/40">canva.link/*</span> and <span className="text-indigo-300 font-mono text-xs bg-indigo-950/60 px-1.5 py-0.5 rounded border border-indigo-800/40">canva.com/design/*</span>), embed code, or exported graphic. Our AI deconstructs the canvas into native Photoshop text layers, vector shapes, and discrete assets.
         </p>
       </div>
 
@@ -120,7 +125,7 @@ export const CanvaInputSection: React.FC<CanvaInputSectionProps> = ({
               type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Paste Canva link (e.g. https://www.canva.com/design/.../view or embed code)"
+              placeholder="Paste Canva link (e.g. https://canva.link/v92m6dsuhpaqabs or canva.com/design/...)"
               disabled={isLoading}
               className="w-full pl-11 pr-4 py-3.5 bg-slate-950 border border-slate-700/80 rounded-xl text-slate-100 text-sm placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 transition-all disabled:opacity-50"
             />
